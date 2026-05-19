@@ -124,8 +124,11 @@ function validateAndFixState(raw: unknown): {
             const resolved = arr
               .map((item) => {
                 if (!item || typeof item !== "object") return null;
+                const hasId = "id" in item;
                 const pid =
-                  typeof (item as any).id === "number" ? (item as any).id : NaN;
+                  hasId && typeof (item as { id: unknown }).id === "number"
+                    ? (item as { id: number }).id
+                    : NaN;
                 return Number.isFinite(pid) ? (resolve(pid) ?? null) : null;
               })
               .filter((p): p is Player => Boolean(p));
@@ -165,23 +168,24 @@ function validateAndFixState(raw: unknown): {
       ? Object.entries(parsed.standings).reduce<Record<number, Standing>>(
           (acc, [key, value]) => {
             if (!value || typeof value !== "object") return acc;
+            const standingsValue = value as Record<string, unknown>;
             const id = Number(key);
             if (!Number.isFinite(id) || !resolve(id)) return acc;
             const points =
-              typeof (value as any).points === "number"
-                ? (value as any).points
+              typeof standingsValue.points === "number"
+                ? standingsValue.points
                 : 0;
             const matchesPlayed =
-              typeof (value as any).matchesPlayed === "number"
-                ? (value as any).matchesPlayed
+              typeof standingsValue.matchesPlayed === "number"
+                ? standingsValue.matchesPlayed
                 : 0;
             const goalDiff =
-              typeof (value as any).goalDiff === "number"
-                ? (value as any).goalDiff
+              typeof standingsValue.goalDiff === "number"
+                ? standingsValue.goalDiff
                 : 0;
             const name =
-              typeof (value as any).name === "string"
-                ? (value as any).name
+              typeof standingsValue.name === "string"
+                ? standingsValue.name
                 : resolve(id)!.name;
             acc[id] = { id, name, points, matchesPlayed, goalDiff };
             return acc;
@@ -368,7 +372,9 @@ export default function Page() {
       setMatchIndex(safe.matchIndex);
       setStandings(safe.standings);
       setTab(safe.tab);
-    } catch (_) {}
+    } catch {
+      // ignore invalid persisted state
+    }
   }, []);
 
   useEffect(() => {
@@ -388,7 +394,9 @@ export default function Page() {
           tab,
         }),
       );
-    } catch (_) {}
+    } catch {
+      // ignore persistence failures
+    }
   }, [dbPlayers, target, tournament, matchIndex, standings, tab]);
 
   const showMsg = useCallback(
