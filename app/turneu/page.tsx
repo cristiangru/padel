@@ -1,26 +1,33 @@
 "use client";
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 
-type Player = {
-  id: number;
-  name: string;
-};
+// ─── TYPES ────────────────────────────────────────────────────────────────────
 
-type PlayerState = Player & {
-  matchesPlayed: number;
-  points: number;
-  goalDiff: number;
-};
+type Player = { id: number; name: string };
 
 type MatchState = {
   id: string;
+  index: number;
   teamA: Player[];
   teamB: Player[];
+  sitting: Player[];
   scoreA: string;
   scoreB: string;
   target: number;
   saved: boolean;
 };
+
+type Standing = {
+  id: number;
+  name: string;
+  points: number;
+  matchesPlayed: number;
+  goalDiff: number;
+};
+
+type Tab = "players" | "selection" | "matches" | "standings";
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
 const INITIAL_PLAYERS: Player[] = [
   { id: 1, name: "Cristica" },
@@ -42,563 +49,723 @@ const INITIAL_PLAYERS: Player[] = [
 
 const GAME_TARGETS = [8, 12, 16];
 
+function calculateAmericanoMatches(playerCount: number) {
+  return Math.ceil((playerCount * (playerCount - 1)) / 4);
+}
+
+// ─── ALGORITHM: SINGLE COURT AMERICANO ───────────────────────────────────────
+// One court at a time. Each match: 4 play, rest sit out.
+// Fair rotation: those who sat out longest get priority to play next.
+// Partner rotation: minimise repetition across the session.
+
+function generateSingleCourtAmericano(
+  ids: number[],
+  allPlayers: Player[],
+  totalMatches: number,
+  target: number
+): MatchState[] {
+  const n = ids.length;
+  if (n < 4) return [];
+
+  const matches: MatchState[] = [];
+  const partnerCount: Record<string, number> = {};
+  // sitWeight: higher = hasn't played recently, should play next
+  const playWeight: Record<number, number> = {};
+  ids.forEach((id) => (playWeight[id] = 0));
+
+  function pairKey(a: number, b: number) {
+    return a < b ? `${a}-${b}` : `${b}-${a}`;
+  }
+  function getPairScore(a: number, b: number) {
+    return partnerCount[pairKey(a, b)] ?? 0;
+  }
+  function recordPair(a: number, b: number) {
+    const k = pairKey(a, b);
+    partnerCount[k] = (partnerCount[k] ?? 0) + 1;
+  }
+
+  const resolve = (id: number) => allPlayers.find((p) => p.id === id)!;
+
+  for (let m = 0; m < totalMatches; m++) {
+    // Sort by weight descending: those who sat out more go first
+    const sorted = [...ids].sort((a, b) => playWeight[b] - playWeight[a]);
+    const playIds = sorted.slice(0, 4);
+    const sittingIds = sorted.slice(4);
+
+    // Pick pairing that minimises partner repetition
+    const options: [[number, number], [number, number]][] = [
+      [[playIds[0], playIds[1]], [playIds[2], playIds[3]]],
+      [[playIds[0], playIds[2]], [playIds[1], playIds[3]]],
+      [[playIds[0], playIds[3]], [playIds[1], playIds[2]]],
+    ];
+    let best = options[0];
+    let bestScore = Infinity;
+    for (const opt of options) {
+      const s = getPairScore(opt[0][0], opt[0][1]) + getPairScore(opt[1][0], opt[1][1]);
+      if (s < bestScore) { bestScore = s; best = opt; }
+    }
+
+    recordPair(best[0][0], best[0][1]);
+    recordPair(best[1][0], best[1][1]);
+
+    // Players who played lose weight; sitting players gain weight
+    playIds.forEach((id) => { playWeight[id] -= n; });
+    sittingIds.forEach((id) => { playWeight[id] += 4; });
+
+    matches.push({
+      id: `m-${m}`,
+      index: m,
+      teamA: best[0].map(resolve),
+      teamB: best[1].map(resolve),
+      sitting: sittingIds.map(resolve),
+      scoreA: "",
+      scoreB: "",
+      target,
+      saved: false,
+    });
+  }
+
+  return matches;
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+function firstName(name: string) { return name.split(" ")[0]; }
+function initials(name: string) {
+  return name.split(" ").map((w) => w[0]).join("").slice(0, 2).toUpperCase();
+}
+
+// ─── COMPONENT ────────────────────────────────────────────────────────────────
+
 export default function Page() {
-  const [tab, setTab] = useState<"players" | "selection" | "matches" | "standings">("players");
-  const [target, setTarget] = useState<number>(12);
-
+  const [tab, setTab] = useState<Tab>("selection");
   const [dbPlayers, setDbPlayers] = useState<Player[]>(INITIAL_PLAYERS);
-  const [players, setPlayers] = useState<PlayerState[]>([]);
   const [presentIds, setPresentIds] = useState<number[]>(INITIAL_PLAYERS.map((p) => p.id));
-  
-  const [allMatches, setAllMatches] = useState<MatchState[]>([]);
-  const [currentMatchIndex, setCurrentMatchIndex] = useState<number>(0);
-  const [tournamentStarted, setTournamentStarted] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-
+  const [target, setTargetState] = useState(12);
+  const [tournament, setTournament] = useState<MatchState[] | null>(null);
+  const [matchIndex, setMatchIndex] = useState(0);
+  const [standings, setStandings] = useState<Record<number, Standing>>({});
+  const [message, setMessage] = useState<{ text: string; type: "ok" | "warn" | "err" } | null>(null);
   const [newPlayerName, setNewPlayerName] = useState("");
-  const [editingPlayerId, setEditingPlayerId] = useState<number | null>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [scoreA, setScoreA] = useState("");
+  const [scoreB, setScoreB] = useState("");
 
-  const [inputScoreA, setInputScoreA] = useState<string>("");
-  const [inputScoreB, setInputScoreB] = useState<string>("");
-
-  // --- EFECTE: PERSISTENȚĂ ÎN LOCAL STORAGE ---
+  // ── Persistence ──
   useEffect(() => {
-    const savedDbPlayers = localStorage.getItem("padel_dbPlayers");
-    const savedPresentIds = localStorage.getItem("padel_presentIds");
-    const savedPlayers = localStorage.getItem("padel_players");
-    const savedMatches = localStorage.getItem("padel_allMatches");
-    const savedIdx = localStorage.getItem("padel_currentMatchIndex");
-    const savedStarted = localStorage.getItem("padel_tournamentStarted");
-    const savedTarget = localStorage.getItem("padel_target");
-
-    if (savedDbPlayers) setDbPlayers(JSON.parse(savedDbPlayers));
-    if (savedPresentIds) setPresentIds(JSON.parse(savedPresentIds));
-    if (savedPlayers) setPlayers(JSON.parse(savedPlayers));
-    if (savedMatches) setAllMatches(JSON.parse(savedMatches));
-    if (savedIdx) setCurrentMatchIndex(Number(savedIdx));
-    if (savedStarted) setTournamentStarted(JSON.parse(savedStarted));
-    if (savedTarget) setTarget(Number(savedTarget));
+    try {
+      const raw = localStorage.getItem("padel_v4");
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      if (s.dbPlayers) setDbPlayers(s.dbPlayers);
+      if (s.presentIds) setPresentIds(s.presentIds);
+      if (s.target) setTargetState(s.target);
+      if (s.tournament) setTournament(s.tournament);
+      if (s.matchIndex !== undefined) setMatchIndex(s.matchIndex);
+      if (s.standings) setStandings(s.standings);
+      if (s.tab) setTab(s.tab);
+    } catch (_) {}
   }, []);
 
   useEffect(() => {
-    localStorage.setItem("padel_dbPlayers", JSON.stringify(dbPlayers));
-    localStorage.setItem("padel_presentIds", JSON.stringify(presentIds));
-    localStorage.setItem("padel_players", JSON.stringify(players));
-    localStorage.setItem("padel_allMatches", JSON.stringify(allMatches));
-    localStorage.setItem("padel_currentMatchIndex", currentMatchIndex.toString());
-    localStorage.setItem("padel_tournamentStarted", JSON.stringify(tournamentStarted));
-    localStorage.setItem("padel_target", target.toString());
-  }, [dbPlayers, presentIds, players, allMatches, currentMatchIndex, tournamentStarted, target]);
+    try {
+      localStorage.setItem("padel_v4", JSON.stringify({ dbPlayers, presentIds, target, tournament, matchIndex, standings, tab }));
+    } catch (_) {}
+  }, [dbPlayers, presentIds, target, tournament, matchIndex, standings, tab]);
 
-  // --- MANAGEMENT JUCĂTORI ---
+  const showMsg = useCallback((text: string, type: "ok" | "warn" | "err" = "warn") => {
+    setMessage({ text, type });
+    setTimeout(() => setMessage(null), 4000);
+  }, []);
+
+  // ── Players ──
   function handleAddPlayer() {
-    if (!newPlayerName.trim()) return;
-    const newPlayer: Player = { id: Date.now(), name: newPlayerName.trim() };
-    setDbPlayers((prev) => [...prev, newPlayer]);
-    setPresentIds((prev) => [...prev, newPlayer.id]);
+    const name = newPlayerName.trim();
+    if (!name) { showMsg("Introdu un nume valid."); return; }
+    const p: Player = { id: Date.now(), name };
+    setDbPlayers((prev) => [...prev, p]);
+    setPresentIds((prev) => [...prev, p.id]);
     setNewPlayerName("");
-    setMessage(`✅ Jucătorul "${newPlayer.name}" a fost adăugat.`);
-  }
-
-  function handleStartEdit(player: Player) {
-    setEditingPlayerId(player.id);
-    setEditingName(player.name);
-  }
-
-  function handleSaveEdit(id: number) {
-    if (!editingName.trim()) return;
-    setDbPlayers((prev) => prev.map((p) => (p.id === id ? { ...p, name: editingName.trim() } : p)));
-    setEditingPlayerId(null);
-    setEditingName("");
-    setMessage("📝 Numele jucătorului a fost actualizat.");
+    showMsg(`"${name}" adăugat!`, "ok");
   }
 
   function handleDeletePlayer(id: number) {
-    if (tournamentStarted) {
-      setMessage("❌ Nu poți șterge jucători în timpul unui turneu activ!");
-      return;
-    }
-    const playerToDelete = dbPlayers.find((p) => p.id === id);
+    if (tournament) { showMsg("Nu poți șterge în timpul turneului!", "err"); return; }
     setDbPlayers((prev) => prev.filter((p) => p.id !== id));
-    setPresentIds((prev) => prev.filter((presentId) => presentId !== id));
-    if (playerToDelete) setMessage(`🗑️ Jucătorul "${playerToDelete.name}" a fost șters.`);
+    setPresentIds((prev) => prev.filter((x) => x !== id));
   }
 
-  // --- ALGORITM GENERARE PADEL AMERICANO (OPTIMIZAT COMPLET) ---
-  function generateTournamentMatches(selectedIds: number[]): MatchState[] {
-    const list: MatchState[] = [];
-    const n = selectedIds.length;
-    const activePlayers = dbPlayers.filter(p => selectedIds.includes(p.id));
-
-    // Generăm toate combinațiile unice de 4 jucători
-    for (let i = 0; i < n; i++) {
-      for (let j = i + 1; j < n; j++) {
-        for (let k = j + 1; k < n; k++) {
-          for (let l = k + 1; l < n; l++) {
-            const p1 = activePlayers[i];
-            const p2 = activePlayers[j];
-            const p3 = activePlayers[k];
-            const p4 = activePlayers[l];
-
-            if (p1 && p2 && p3 && p4) {
-              // Pentru fiecare grup de 4 jucători, există exact 3 combinații unice de meciuri:
-              const matchCombinations = [
-                { tA: [p1, p2], tB: [p3, p4], type: "v1" },
-                { tA: [p1, p3], tB: [p2, p4], type: "v2" },
-                { tA: [p1, p4], tB: [p2, p3], type: "v3" }
-              ];
-
-              matchCombinations.forEach((combo) => {
-                list.push({
-                  // ID stabil și predictibil format din id-urile unice ale jucătorilor ordonați crescător
-                  id: `m-${p1.id}-${p2.id}-${p3.id}-${p4.id}-${combo.type}`,
-                  teamA: combo.tA,
-                  teamB: combo.tB,
-                  scoreA: "",
-                  scoreB: "",
-                  target: target,
-                  saved: false,
-                });
-              });
-            }
-          }
-        }
-      }
-    }
-
-    // Amestecăm meciurile pentru varietate pe teren
-    return list.sort(() => Math.random() - 0.5);
+  function handleSaveEdit(id: number) {
+    const name = editingName.trim();
+    if (!name) return;
+    setDbPlayers((prev) => prev.map((p) => (p.id === id ? { ...p, name } : p)));
+    setEditingId(null);
   }
 
+  // ── Tournament ──
   function startTournament() {
-    const validPresentIds = presentIds.filter(id => dbPlayers.some(p => p.id === id));
-    if (validPresentIds.length < 4) {
-      setMessage("❌ Selectează cel puțin 4 jucători pentru a putea forma un meci!");
-      return;
-    }
-    setMessage(null);
-    setPlayers(dbPlayers.filter(p => validPresentIds.includes(p.id)).map(p => ({ ...p, matchesPlayed: 0, points: 0, goalDiff: 0 })));
-
-    const schedule = generateTournamentMatches(validPresentIds);
-    if (schedule.length === 0) {
-      setMessage("❌ Eroare la generarea meciurilor.");
-      return;
-    }
-
-    setAllMatches(schedule);
-    setCurrentMatchIndex(0);
-    setInputScoreA("");
-    setInputScoreB("");
-    setTournamentStarted(true);
+    const validIds = presentIds.filter((id) => dbPlayers.some((p) => p.id === id));
+    if (validIds.length < 4) { showMsg("Minim 4 jucători necesari!", "err"); return; }
+    const autoMatchCount = calculateAmericanoMatches(validIds.length);
+    const matches = generateSingleCourtAmericano(validIds, dbPlayers, autoMatchCount, target);
+    const initS: Record<number, Standing> = {};
+    validIds.forEach((id) => {
+      const p = dbPlayers.find((x) => x.id === id);
+      if (p) initS[id] = { id, name: p.name, points: 0, matchesPlayed: 0, goalDiff: 0 };
+    });
+    setStandings(initS);
+    setTournament(matches);
+    setMatchIndex(0);
+    setScoreA(""); setScoreB("");
     setTab("matches");
   }
 
-  // --- LOGICĂ CONTROL MECIURI ---
-  function saveCurrentScore() {
-    const currentMatch = allMatches[currentMatchIndex];
-    if (!currentMatch) return;
+  function resetTournament() {
+    if (!window.confirm("Resetezi turneul? Toate scorurile se pierd.")) return;
+    setTournament(null); setMatchIndex(0); setStandings({});
+    setScoreA(""); setScoreB("");
+    setTab("selection");
+  }
 
-    const valA = inputScoreA.trim();
-    const valB = inputScoreB.trim();
+  function saveScore() {
+    if (!tournament) return;
+    const m = tournament[matchIndex];
+    if (!m) return;
+    const a = parseInt(scoreA, 10);
+    const b = parseInt(scoreB, 10);
+    if (isNaN(a) || isNaN(b) || a < 0 || b < 0) { showMsg("Introdu scoruri valide.", "err"); return; }
+    if (a + b !== m.target) { showMsg(`Suma trebuie să fie ${m.target}. Acum e ${a + b}.`, "err"); return; }
 
-    if (valA === "" || valB === "") {
-      setMessage("⚠️ Introdu scorul complet pentru ambele echipe.");
-      return;
-    }
-
-    const a = parseInt(valA, 10);
-    const b = parseInt(valB, 10);
-
-    if (isNaN(a) || isNaN(b) || a < 0 || b < 0) {
-      setMessage("⚠️ Scorul trebuie să conțină doar numere pozitive.");
-      return;
-    }
-
-    if (a + b !== currentMatch.target) {
-      setMessage(`❌ EROARE: Suma punctelor (${a} + ${b} = ${a + b}) trebuie să fie EXACT ${currentMatch.target}!`);
-      return;
-    }
-
-    setMessage(null);
-
-    // Salvare în clasament individual
-    setPlayers((prev) =>
-      prev.map((pl) => {
-        const isTeamA = currentMatch.teamA.some((x) => x.id === pl.id);
-        const isTeamB = currentMatch.teamB.some((x) => x.id === pl.id);
-        if (isTeamA) return { ...pl, matchesPlayed: pl.matchesPlayed + 1, points: pl.points + a, goalDiff: pl.goalDiff + (a - b) };
-        if (isTeamB) return { ...pl, matchesPlayed: pl.matchesPlayed + 1, points: pl.points + b, goalDiff: pl.goalDiff + (b - a) };
-        return pl;
-      })
-    );
-
-    // Salvare starea meciului curent
-    setAllMatches((prev) => {
+    setStandings((prev) => {
+      const next = { ...prev };
+      m.teamA.forEach((p) => {
+        if (next[p.id]) next[p.id] = { ...next[p.id], points: next[p.id].points + a, matchesPlayed: next[p.id].matchesPlayed + 1, goalDiff: next[p.id].goalDiff + (a - b) };
+      });
+      m.teamB.forEach((p) => {
+        if (next[p.id]) next[p.id] = { ...next[p.id], points: next[p.id].points + b, matchesPlayed: next[p.id].matchesPlayed + 1, goalDiff: next[p.id].goalDiff + (b - a) };
+      });
+      return next;
+    });
+    setTournament((prev) => {
+      if (!prev) return prev;
       const copy = [...prev];
-      copy[currentMatchIndex] = { ...copy[currentMatchIndex], saved: true, scoreA: String(a), scoreB: String(b) };
+      copy[matchIndex] = { ...copy[matchIndex], scoreA: String(a), scoreB: String(b), saved: true };
       return copy;
     });
-
-    setInputScoreA("");
-    setInputScoreB("");
-
-    const nextIdx = currentMatchIndex + 1;
-    if (nextIdx < allMatches.length) {
-      setCurrentMatchIndex(nextIdx);
-    } else {
-      setTournamentStarted(false);
-      setTab("standings");
-      setMessage("🏆 Felicitări! Toate meciurile au fost salvate și turneul s-a încheiat.");
+    setScoreA(""); setScoreB("");
+    const next = matchIndex + 1;
+    setMatchIndex(next);
+    if (next >= tournament.length) {
+      showMsg("Turneu finalizat! 🏆", "ok");
+      setTimeout(() => setTab("standings"), 900);
     }
   }
 
-  function handleGoToPreviousMatch() {
-    if (currentMatchIndex === 0) return;
-
-    const prevIdx = currentMatchIndex - 1;
-    const prevMatch = allMatches[prevIdx];
-    if (!prevMatch) return;
-
-    setMessage(`🔄 Te-ai întors la Meciul ${prevIdx + 1}. Clasamentul a fost recalculat.`);
-
-    if (prevMatch.saved) {
-      const oldA = parseInt(prevMatch.scoreA, 10) || 0;
-      const oldB = parseInt(prevMatch.scoreB, 10) || 0;
-
-      setPlayers((prev) =>
-        prev.map((pl) => {
-          const isTeamA = prevMatch.teamA.some((x) => x.id === pl.id);
-          const isTeamB = prevMatch.teamB.some((x) => x.id === pl.id);
-          if (isTeamA) {
-            return { ...pl, matchesPlayed: Math.max(0, pl.matchesPlayed - 1), points: Math.max(0, pl.points - oldA), goalDiff: pl.goalDiff - (oldA - oldB) };
-          }
-          if (isTeamB) {
-            return { ...pl, matchesPlayed: Math.max(0, pl.matchesPlayed - 1), points: Math.max(0, pl.points - oldB), goalDiff: pl.goalDiff - (oldB - oldA) };
-          }
-          return pl;
-        })
-      );
+  function prevMatch() {
+    if (!tournament || matchIndex === 0) return;
+    const prev = tournament[matchIndex - 1];
+    if (!prev) return;
+    if (prev.saved) {
+      const a = parseInt(prev.scoreA, 10) || 0;
+      const b = parseInt(prev.scoreB, 10) || 0;
+      setStandings((s) => {
+        const next = { ...s };
+        prev.teamA.forEach((p) => { if (next[p.id]) next[p.id] = { ...next[p.id], points: Math.max(0, next[p.id].points - a), matchesPlayed: Math.max(0, next[p.id].matchesPlayed - 1), goalDiff: next[p.id].goalDiff - (a - b) }; });
+        prev.teamB.forEach((p) => { if (next[p.id]) next[p.id] = { ...next[p.id], points: Math.max(0, next[p.id].points - b), matchesPlayed: Math.max(0, next[p.id].matchesPlayed - 1), goalDiff: next[p.id].goalDiff - (b - a) }; });
+        return next;
+      });
+      setTournament((t) => { if (!t) return t; const c = [...t]; c[matchIndex - 1] = { ...c[matchIndex - 1], saved: false, scoreA: "", scoreB: "" }; return c; });
+      setScoreA(prev.scoreA); setScoreB(prev.scoreB);
     }
+    setMatchIndex((i) => i - 1);
+  }
 
-    setAllMatches((prev) => {
+  function skipMatch() {
+    if (!tournament) return;
+    const m = tournament[matchIndex];
+    if (!m || m.saved) return;
+    setTournament((prev) => {
+      if (!prev) return prev;
       const copy = [...prev];
-      copy[prevIdx] = { ...copy[prevIdx], saved: false };
+      const [sk] = copy.splice(matchIndex, 1);
+      copy.push({ ...sk, scoreA: "", scoreB: "" });
       return copy;
     });
-
-    setInputScoreA(prevMatch.scoreA);
-    setInputScoreB(prevMatch.scoreB);
-    setCurrentMatchIndex(prevIdx);
+    showMsg("Meci trimis la coadă.");
   }
 
-  function handleResetCurrentMatch() {
-    setInputScoreA("");
-    setInputScoreB("");
-    setMessage("🧹 Scorul meciului curent a fost șters de pe ecran.");
-  }
+  // ── Derived ──
+  const currentMatch = tournament?.[matchIndex] ?? null;
+  const nextMatches = tournament?.slice(matchIndex + 1, matchIndex + 6) ?? [];
+  const totalMatches = tournament?.length ?? 0;
+  const doneMatches = tournament?.filter((m) => m.saved).length ?? 0;
+  const progress = totalMatches > 0 ? Math.round((doneMatches / totalMatches) * 100) : 0;
+  const validN = presentIds.filter((id) => dbPlayers.some((p) => p.id === id)).length;
 
-  function handleResetEntireTournament() {
-    if (window.confirm("Sigur vrei să resetezi complet turneul? Toate scorurile se vor șterge!")) {
-      setTournamentStarted(false);
-      setAllMatches([]);
-      setCurrentMatchIndex(0);
-      setInputScoreA("");
-      setInputScoreB("");
-      setPlayers([]);
-      setMessage("🔄 Turneul a fost resetat complet. Poți configura o nouă listă.");
-      setTab("selection");
-      localStorage.removeItem("padel_players");
-      localStorage.removeItem("padel_allMatches");
-      localStorage.removeItem("padel_currentMatchIndex");
-      localStorage.removeItem("padel_tournamentStarted");
-    }
-  }
+  const sortedStandings = useMemo(
+    () => Object.values(standings).sort((a, b) => b.points - a.points || b.goalDiff - a.goalDiff),
+    [standings]
+  );
 
-  function skipCurrentMatch() {
-    if (!tournamentStarted || allMatches.length <= 1) return;
-    const currentMatch = allMatches[currentMatchIndex];
-    if (!currentMatch || currentMatch.saved) return;
+  const medals = ["🥇", "🥈", "🥉"];
 
-    setMessage("🔄 Meci trimis la coadă!");
-
-    const skippedMatch: MatchState = {
-      ...currentMatch,
-      scoreA: "",
-      scoreB: ""
-    };
-
-    setAllMatches((prev) => {
-      const copy = [...prev];
-      copy.splice(currentMatchIndex, 1);
-      copy.push(skippedMatch);
-      return copy;
-    });
-
-    setInputScoreA("");
-    setInputScoreB("");
-  }
-
-  const currentMatch = allMatches[currentMatchIndex] || null;
-  const nextMatch = allMatches[currentMatchIndex + 1] || null;
-
-  const sittingPlayers = useMemo(() => {
-    if (!currentMatch) return [];
-    const playingIds = [...currentMatch.teamA.map((p) => p.id), ...currentMatch.teamB.map((p) => p.id)];
-    return players.filter((p) => presentIds.includes(p.id) && !playingIds.includes(p.id));
-  }, [players, currentMatch, presentIds]);
-
-  const standings = useMemo(() => {
-    return [...players]
-      .filter((p) => presentIds.includes(p.id))
-      .sort((a, b) => b.points - a.points || b.goalDiff - a.goalDiff);
-  }, [players, presentIds]);
+  const navBtn = (t: Tab, icon: string, label: string) => (
+    <button
+      onClick={() => setTab(t)}
+      className={`flex flex-col items-center justify-center flex-1 gap-0.5 py-2 transition-all ${tab === t ? "text-[#00ff88]" : "text-gray-600 hover:text-gray-400"}`}
+    >
+      <span className={`text-xl transition-transform ${tab === t ? "scale-110" : ""}`}>{icon}</span>
+      <span className="text-[8px] font-black tracking-[0.12em] uppercase">{label}</span>
+      {tab === t && <span className="block w-4 h-0.5 bg-[#00ff88] rounded-full mt-0.5" />}
+    </button>
+  );
 
   return (
-    <div className="min-h-screen bg-[#09090e] text-[#f1f1f7] pb-24 font-sans selection:bg-green-500 selection:text-black">
-      <div className="max-w-md mx-auto p-4">
-        
-        <header className="mb-6 flex items-center justify-between bg-[#11111a] p-4 rounded-2xl border border-gray-800/60 shadow-lg">
-          <div>
-            <h1 className="text-xl font-black tracking-wider text-green-400 uppercase">Padel American</h1>
-            <p className="text-xs text-gray-500 font-medium">
-              {tournamentStarted ? `Meciul ${currentMatchIndex + 1} din ${allMatches.length}` : "Configurare Turneu"}
-            </p>
+    <div className="min-h-screen bg-[#06070f] text-[#e8e8f0] pb-20 antialiased">
+      <div className="max-w-md mx-auto px-4 pt-5">
+
+        {/* ── HEADER ── */}
+        <header className="mb-6">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-[9px] font-black tracking-[0.3em] uppercase text-[#00ff88]/70 mb-1">Un teren · Americano</p>
+              <h1 className="text-[28px] font-black uppercase tracking-tight leading-none text-white">
+                Padel<br />
+                <span className="text-[#00ff88]">Americano</span>
+              </h1>
+            </div>
+            <div className="text-right">
+              {tournament ? (
+                <div className="text-right">
+                  <p className="text-[9px] text-gray-600 uppercase tracking-widest font-black mb-1">Progres</p>
+                  <p className="text-2xl font-black tabular-nums text-white leading-none">
+                    {doneMatches}<span className="text-gray-600 text-sm font-medium">/{totalMatches}</span>
+                  </p>
+                  <button
+                    onClick={resetTournament}
+                    className="mt-2 text-[9px] font-black uppercase tracking-wider text-red-500 border border-red-500/25 px-2.5 py-1 rounded-lg hover:bg-red-500/8 transition-all"
+                  >
+                    Reset 🚨
+                  </button>
+                </div>
+              ) : (
+                <div className="w-12 h-12 rounded-2xl border border-[#00ff88]/15 bg-[#00ff88]/4 flex items-center justify-center text-2xl">🎾</div>
+              )}
+            </div>
           </div>
-          {tournamentStarted && (
-            <button 
-              onClick={handleResetEntireTournament}
-              className="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-[10px] font-extrabold px-2.5 py-1 rounded-md uppercase transition-all"
-            >
-              Reset Turneu 🚨
-            </button>
+
+          {tournament && (
+            <div className="mt-4 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[9px] font-black text-gray-600 uppercase tracking-widest">{progress}% complet</span>
+                <span className="text-[9px] font-bold text-gray-600">Meci {Math.min(matchIndex + 1, totalMatches)} din {totalMatches}</span>
+              </div>
+              <div className="h-[3px] bg-white/5 rounded-full overflow-hidden">
+                <div className="h-full bg-[#00ff88] rounded-full transition-all duration-700" style={{ width: `${progress}%` }} />
+              </div>
+            </div>
           )}
         </header>
 
+        {/* ── MESSAGE ── */}
         {message && (
-          <div className="mb-4 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-400 text-xs font-semibold text-center">
-            {message}
+          <div className={`mb-4 px-4 py-2.5 rounded-xl text-xs font-bold text-center border ${
+            message.type === "ok"   ? "bg-[#00ff88]/8 border-[#00ff88]/20 text-[#00ff88]" :
+            message.type === "err"  ? "bg-red-500/8 border-red-500/20 text-red-400" :
+            "bg-amber-500/8 border-amber-500/20 text-amber-400"
+          }`}>
+            {message.text}
           </div>
         )}
 
-        {/* TAB JUCĂTORI */}
-        {tab === "players" && (
-          <section className="space-y-4">
-            <div className="bg-[#11111a] p-4 rounded-2xl border border-gray-800/60 shadow-sm space-y-3">
-              <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400">Adaugă jucător nou</h3>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  placeholder="Nume..."
-                  value={newPlayerName}
-                  onChange={(e) => setNewPlayerName(e.target.value)}
-                  className="flex-1 bg-[#161622] px-4 py-3 rounded-xl border border-gray-800 text-sm font-semibold text-white outline-none focus:border-green-500"
-                />
-                <button onClick={handleAddPlayer} className="bg-green-500 hover:bg-green-400 text-black font-black px-4 rounded-xl text-base">＋</button>
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 px-1">Jucători în sistem</h3>
-              <div className="grid gap-2 max-h-[48vh] overflow-y-auto pr-1">
-                {dbPlayers.map((p) => (
-                  <div key={p.id} className="flex items-center justify-between p-3 bg-[#11111a] border border-gray-800/60 rounded-xl">
-                    {editingPlayerId === p.id ? (
-                      <div className="flex gap-2 flex-1 mr-2">
-                        <input
-                          type="text"
-                          value={editingName}
-                          onChange={(e) => setEditingName(e.target.value)}
-                          className="flex-1 bg-[#161622] px-3 py-1.5 rounded-lg border border-gray-700 text-xs font-semibold text-white outline-none"
-                        />
-                        <button onClick={() => handleSaveEdit(p.id)} className="bg-green-500 text-black text-[10px] font-black px-2.5 rounded-lg uppercase">Salvați</button>
-                      </div>
-                    ) : (
-                      <span className="font-semibold text-sm text-gray-200">{p.name}</span>
-                    )}
-                    <div className="flex gap-3 text-sm">
-                      {editingPlayerId !== p.id && <button onClick={() => handleStartEdit(p)} className="text-gray-400 hover:text-green-400">✏️</button>}
-                      <button onClick={() => handleDeletePlayer(p.id)} className="text-gray-500 hover:text-red-400">🗑️</button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* TAB PREZENȚĂ */}
+        {/* ══════════ TAB: SELECȚIE ══════════ */}
         {tab === "selection" && (
           <section className="space-y-5">
-            <div className="bg-[#11111a] p-4 rounded-2xl border border-gray-800/60 shadow-sm">
-              <div className="flex items-center justify-between mb-3 text-[11px] text-gray-400 uppercase tracking-widest font-bold">
-                <span>Puncte țintă per meci</span>
-                <span className="text-green-400 font-black">{target} PCT</span>
+
+            {/* Config */}
+            <div className="rounded-2xl border border-white/8 bg-white/[0.02] p-5 space-y-5">
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-[0.25em] text-gray-500 mb-3">Puncte țintă per meci</p>
+                <div className="grid grid-cols-3 gap-2">
+                  {GAME_TARGETS.map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => setTargetState(t)}
+                      disabled={!!tournament}
+                      className={`py-3 rounded-xl text-sm font-black border transition-all disabled:opacity-40 ${target === t
+                        ? "border-[#00ff88]/50 text-[#00ff88] bg-[#00ff88]/8"
+                        : "border-white/8 text-gray-500 hover:border-white/15 hover:text-gray-300"}`}
+                    >
+                      {t} <span className="text-[9px] font-semibold opacity-70">pct</span>
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div className="flex gap-2">
-                {GAME_TARGETS.map((t) => (
-                  <button
-                    key={t}
-                    type="button"
-                    disabled={tournamentStarted}
-                    onClick={() => setTarget(t)}
-                    className={`flex-1 py-3 rounded-xl text-sm font-black border transition-all ${target === t ? "border-green-500 text-green-400 bg-green-500/10" : "border-gray-800 text-gray-500 bg-[#161622]"}`}
-                  >
-                    {t}
-                  </button>
-                ))}
+
+              <div className="rounded-2xl border border-[#00ff88]/10 bg-[#00ff88]/5 p-4 text-sm font-black text-[#00ff88]">
+                <p className="uppercase tracking-[0.25em] text-[9px] text-[#d3ffcc] mb-2">Americano complet generat automat</p>
+                <p className="leading-tight">Numărul de meciuri este calculat automat pentru {validN} jucători și acoperă rotația echilibrată cu odihnă corectă.</p>
               </div>
             </div>
 
-            <div className="space-y-2">
-              <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 px-1">Cine joacă în turneul ăsta?:</h3>
-              <div className="grid gap-2 max-h-[42vh] overflow-y-auto pr-1">
+            {/* Info pill */}
+            <div className={`flex items-center justify-between px-4 py-3 rounded-xl border text-[11px] font-bold ${validN < 4
+              ? "border-red-500/20 bg-red-500/5 text-red-400"
+              : "border-[#00ff88]/15 bg-[#00ff88]/4 text-[#00ff88]"}`}
+            >
+              {validN < 4
+                ? <span>❌ Minim 4 jucători necesari</span>
+                : <>
+                    <span>✓ {validN} selectați · {calculateAmericanoMatches(validN)} meciuri</span>
+                    <span className="text-gray-500">{validN - 4} pe bancă per meci</span>
+                  </>
+              }
+            </div>
+
+            {/* Player grid */}
+            <div>
+              <div className="flex items-center justify-between mb-3 px-0.5">
+                <p className="text-[9px] font-black uppercase tracking-[0.25em] text-gray-500">Cine joacă azi?</p>
+                <button
+                  onClick={() => setPresentIds(presentIds.length === dbPlayers.length ? [] : dbPlayers.map((p) => p.id))}
+                  className="text-[9px] font-black text-gray-600 hover:text-[#00ff88] uppercase tracking-wider transition-colors"
+                >
+                  {presentIds.length === dbPlayers.length ? "Deselectează tot" : "Selectează tot"}
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
                 {dbPlayers.map((p) => {
-                  const isChecked = presentIds.includes(p.id);
+                  const on = presentIds.includes(p.id);
                   return (
-                    <label key={p.id} className={`flex items-center justify-between p-3.5 rounded-xl border transition-all cursor-pointer ${isChecked ? 'bg-green-500/5 border-green-500/30' : 'bg-[#11111a] border-gray-800/60'}`}>
-                      <div className="flex items-center gap-3">
-                        <input
-                          type="checkbox"
-                          disabled={tournamentStarted}
-                          checked={isChecked}
-                          onChange={() => setPresentIds((prev) => prev.includes(p.id) ? prev.filter((id) => id !== p.id) : [...prev, p.id])}
-                          className="w-4 h-4 text-green-500 accent-green-500"
-                        />
-                        <span className={`font-semibold text-sm ${isChecked ? 'text-gray-100' : 'text-gray-400'}`}>{p.name}</span>
+                    <button
+                      key={p.id}
+                      disabled={!!tournament}
+                      onClick={() => setPresentIds((prev) => prev.includes(p.id) ? prev.filter((x) => x !== p.id) : [...prev, p.id])}
+                      className={`flex items-center gap-2.5 px-3 py-3 rounded-xl border text-left transition-all disabled:opacity-50 active:scale-[.97] ${on
+                        ? "border-[#00ff88]/30 bg-[#00ff88]/5 text-white"
+                        : "border-white/7 bg-white/[0.02] text-gray-500 hover:border-white/12"}`}
+                    >
+                      <div className={`w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-[9px] font-black border ${on
+                        ? "bg-[#00ff88]/12 border-[#00ff88]/35 text-[#00ff88]"
+                        : "bg-white/4 border-white/8 text-gray-600"}`}
+                      >
+                        {initials(p.name)}
                       </div>
-                    </label>
+                      <span className={`text-xs font-bold leading-tight flex-1 ${on ? "text-white" : "text-gray-500"}`}>{firstName(p.name)}</span>
+                      {on && <span className="text-[#00ff88] text-xs font-black ml-auto">✓</span>}
+                    </button>
                   );
                 })}
               </div>
             </div>
 
-            <button onClick={startTournament} className="w-full bg-green-500 hover:bg-green-400 text-black font-black py-4 rounded-xl shadow-lg uppercase tracking-wider text-xs">
-              🚀 Generează Configurație
+            <button
+              onClick={startTournament}
+              className="w-full py-4 bg-[#00ff88] hover:bg-[#00e87a] active:scale-[.98] text-[#06070f] font-black text-sm uppercase tracking-[0.15em] rounded-2xl transition-all shadow-lg shadow-[#00ff88]/10 mt-1"
+            >
+              Generează Turneul →
             </button>
           </section>
         )}
 
-        {/* TAB JOC LIVE */}
+        {/* ══════════ TAB: MECIURI ══════════ */}
         {tab === "matches" && (
-          <section className="space-y-4">
-            <div className="flex gap-2">
-              <button
-                type="button"
-                disabled={currentMatchIndex === 0}
-                onClick={handleGoToPreviousMatch}
-                className="flex-1 bg-[#11111a] hover:bg-[#161622] text-xs font-bold text-gray-400 py-2.5 rounded-xl border border-gray-800/80 disabled:opacity-30 disabled:pointer-events-none transition-all"
-              >
-                ⬅ Meciul Anterior
-              </button>
-              <button
-                type="button"
-                onClick={handleResetCurrentMatch}
-                className="flex-1 bg-[#11111a] hover:bg-[#161622] text-xs font-bold text-gray-400 py-2.5 rounded-xl border border-gray-800/80 transition-all"
-              >
-                🧹 Golește Scorul
-              </button>
-            </div>
+          <section className="space-y-3">
 
-            {sittingPlayers.length > 0 && (
-              <div className="bg-amber-500/5 border border-amber-400/20 rounded-xl p-3">
-                <div className="text-[10px] font-bold text-amber-400 uppercase tracking-widest mb-1.5">⏳ Pe bancă tura asta:</div>
-                <div className="flex flex-wrap gap-1">
-                  {sittingPlayers.map(p => (
-                    <span key={p.id} className="bg-amber-400/10 text-amber-400 text-[11px] px-2 py-0.5 rounded-md font-medium">{p.name.split(' ')[0]}</span>
-                  ))}
-                </div>
+            {!currentMatch && tournament && matchIndex >= tournament.length ? (
+              /* Finished */
+              <div className="rounded-2xl border border-[#00ff88]/20 bg-[#00ff88]/4 p-10 text-center space-y-3">
+                <p className="text-5xl">🏆</p>
+                <p className="text-lg font-black text-[#00ff88] uppercase tracking-widest">Turneu Finalizat</p>
+                <p className="text-xs text-gray-500">Vezi clasamentul final</p>
               </div>
+            ) : !currentMatch ? (
+              <div className="rounded-2xl border border-white/8 p-10 text-center text-gray-500 text-sm">
+                Niciun turneu activ. Mergi la Selecție!
+              </div>
+            ) : (
+              <>
+                {/* Bench */}
+                {currentMatch.sitting.length > 0 && (
+                  <div className="flex items-center gap-2.5 px-4 py-3 rounded-xl bg-amber-500/4 border border-amber-500/12">
+                    <span className="text-[9px] font-black uppercase tracking-[0.15em] text-amber-500/60 flex-shrink-0">Bancă:</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {currentMatch.sitting.map((p) => (
+                        <span key={p.id} className="text-[10px] font-bold text-amber-400/80 bg-amber-400/8 px-2 py-0.5 rounded-full border border-amber-400/15">
+                          {firstName(p.name)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Match card */}
+                <div className="rounded-2xl border border-white/10 bg-white/[0.02] overflow-hidden">
+                  {/* Header strip */}
+                  <div className="bg-[#00ff88]/6 border-b border-[#00ff88]/12 px-5 py-3 flex items-center justify-between">
+                    <span className="text-[9px] font-black uppercase tracking-[0.25em] text-[#00ff88]">
+                      Meci {matchIndex + 1} din {totalMatches}
+                    </span>
+                    <span className="text-[9px] font-bold text-gray-600">🎯 {currentMatch.target} puncte total</span>
+                  </div>
+
+                  <div className="p-5 space-y-5">
+                    {/* Teams */}
+                    <div className="grid grid-cols-[1fr_28px_1fr] gap-2 items-center">
+                      <div className="text-center">
+                        <p className="text-[9px] font-black uppercase tracking-[0.2em] text-[#00ff88]/50 mb-2.5">Echipa A</p>
+                        {currentMatch.teamA.map((p) => (
+                          <div key={p.id} className="flex items-center justify-center gap-1.5 mb-1.5">
+                            <div className="w-7 h-7 rounded-full bg-[#00ff88]/8 border border-[#00ff88]/20 flex items-center justify-center text-[9px] font-black text-[#00ff88]">
+                              {initials(p.name)}
+                            </div>
+                            <span className="text-sm font-bold text-white">{firstName(p.name)}</span>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="flex flex-col items-center gap-1.5 self-stretch justify-center">
+                        <div className="flex-1 w-px bg-white/6" />
+                        <span className="text-[9px] font-black text-gray-700 uppercase">vs</span>
+                        <div className="flex-1 w-px bg-white/6" />
+                      </div>
+
+                      <div className="text-center">
+                        <p className="text-[9px] font-black uppercase tracking-[0.2em] text-sky-400/50 mb-2.5">Echipa B</p>
+                        {currentMatch.teamB.map((p) => (
+                          <div key={p.id} className="flex items-center justify-center gap-1.5 mb-1.5">
+                            <div className="w-7 h-7 rounded-full bg-sky-400/8 border border-sky-400/20 flex items-center justify-center text-[9px] font-black text-sky-400">
+                              {initials(p.name)}
+                            </div>
+                            <span className="text-sm font-bold text-white">{firstName(p.name)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Score inputs */}
+                    <div className="flex items-center justify-center gap-5">
+                      <input
+                        type="number" min={0} placeholder="0"
+                        value={scoreA}
+                        onChange={(e) => setScoreA(e.target.value)}
+                        className="w-[76px] h-[68px] bg-[#00ff88]/4 border-2 border-[#00ff88]/20 focus:border-[#00ff88]/60 rounded-2xl text-[#00ff88] font-black text-4xl text-center outline-none transition-all tabular-nums"
+                      />
+                      <div className="text-center">
+                        <p className="text-[10px] font-black tabular-nums text-gray-600">
+                          {(parseInt(scoreA) || 0) + (parseInt(scoreB) || 0)}
+                          <span className="text-gray-700">/{currentMatch.target}</span>
+                        </p>
+                      </div>
+                      <input
+                        type="number" min={0} placeholder="0"
+                        value={scoreB}
+                        onChange={(e) => setScoreB(e.target.value)}
+                        className="w-[76px] h-[68px] bg-sky-400/4 border-2 border-sky-400/20 focus:border-sky-400/60 rounded-2xl text-sky-400 font-black text-4xl text-center outline-none transition-all tabular-nums"
+                      />
+                    </div>
+
+                    {/* Actions */}
+                    <div className="grid grid-cols-3 gap-2">
+                      <button
+                        onClick={prevMatch}
+                        disabled={matchIndex === 0}
+                        className="py-3.5 rounded-xl text-[10px] font-black uppercase tracking-wider text-gray-600 border border-white/8 hover:border-white/15 hover:text-gray-400 transition-all disabled:opacity-25"
+                      >
+                        ← Înapoi
+                      </button>
+                      <button
+                        onClick={skipMatch}
+                        className="py-3.5 rounded-xl text-[10px] font-black uppercase tracking-wider text-gray-600 border border-white/8 hover:border-white/15 hover:text-gray-400 transition-all"
+                      >
+                        Sări →
+                      </button>
+                      <button
+                        onClick={saveScore}
+                        className="py-3.5 rounded-xl text-[10px] font-black uppercase tracking-wider bg-[#00ff88] text-[#06070f] hover:bg-[#00e87a] active:scale-[.97] transition-all"
+                      >
+                        Salvează ✓
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Upcoming */}
+                {nextMatches.length > 0 && (
+                  <div>
+                    <p className="text-[9px] font-black uppercase tracking-[0.25em] text-gray-600 mb-2 px-0.5">Urmează</p>
+                    <div className="space-y-1.5">
+                      {nextMatches.map((m, i) => (
+                        <div key={m.id} className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-white/[0.02] border border-white/5">
+                          <span className="text-[9px] font-black text-gray-700 tabular-nums w-5">#{matchIndex + 2 + i}</span>
+                          <span className="text-[11px] font-semibold text-gray-400">{m.teamA.map((p) => firstName(p.name)).join(" & ")}</span>
+                          <span className="text-[9px] font-black text-gray-700 uppercase px-0.5">vs</span>
+                          <span className="text-[11px] font-semibold text-gray-400">{m.teamB.map((p) => firstName(p.name)).join(" & ")}</span>
+                          {m.sitting.length > 0 && (
+                            <span className="ml-auto text-[9px] text-amber-500/50 font-semibold flex-shrink-0">
+                              {m.sitting.map((p) => firstName(p.name)).join(", ")} stă
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
-
-            <div className="bg-[#11111a] p-5 rounded-2xl border border-gray-800/60 space-y-4">
-              <div className="flex items-center justify-between border-b border-gray-800/50 pb-3">
-                <span className="text-[10px] bg-green-500/10 text-green-400 font-black px-2.5 py-1 rounded-md uppercase">Meciul Activ</span>
-                <span className="text-xs text-gray-400 font-bold">🎯 LIMITĂ {currentMatch?.target} PCT FIX</span>
-              </div>
-
-              {currentMatch ? (
-                <div className="space-y-5">
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="bg-[#161622] p-3 rounded-xl border border-gray-800/30 text-center">
-                      <div className="text-[10px] font-bold text-gray-500 uppercase mb-1">Echipa A</div>
-                      <div className="text-sm font-semibold text-gray-200">{currentMatch.teamA.map(p => p.name.split(' ')[0]).join(" + ")}</div>
-                    </div>
-                    <div className="bg-[#161622] p-3 rounded-xl border border-gray-800/30 text-center">
-                      <div className="text-[10px] font-bold text-gray-500 uppercase mb-1">Echipa B</div>
-                      <div className="text-sm font-semibold text-gray-200">{currentMatch.teamB.map(p => p.name.split(' ')[0]).join(" + ")}</div>
-                    </div>
-                  </div>
-
-                  <div className="flex justify-center items-center gap-4 py-1">
-                    <input type="number" placeholder="0" value={inputScoreA || ""} onChange={(e) => setInputScoreA(e.target.value)} className="w-16 h-14 bg-[#161622] text-center rounded-xl font-black text-white border border-gray-800 text-2xl focus:border-green-500 outline-none" />
-                    <span className="font-bold text-gray-600 text-sm uppercase">vs</span>
-                    <input type="number" placeholder="0" value={inputScoreB || ""} onChange={(e) => setInputScoreB(e.target.value)} className="w-16 h-14 bg-[#161622] text-center rounded-xl font-black text-white border border-gray-800 text-2xl focus:border-green-500 outline-none" />
-                  </div>
-
-                  <div className="flex gap-2 pt-2">
-                    <button type="button" onClick={skipCurrentMatch} className="flex-1 py-3.5 rounded-xl bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold text-xs uppercase tracking-wider border border-gray-700">🕒 Sări meci</button>
-                    <button type="button" onClick={saveCurrentScore} className="flex-[1.5] py-3.5 rounded-xl bg-green-500 hover:bg-green-400 text-black font-black text-xs uppercase tracking-wider shadow-md">Trimite & Salvează ✓</button>
-                  </div>
-                </div>
-              ) : (
-                <div className="text-center py-6 text-sm text-gray-500">Toate meciurile s-au încheiat!</div>
-              )}
-            </div>
-
-            <div className="bg-[#11111a] p-4 rounded-2xl border border-gray-800/60 shadow-sm">
-              <h3 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Următorii la rând:</h3>
-              {nextMatch ? (
-                <div className="text-xs font-semibold bg-[#161622] p-3 rounded-xl border border-gray-800/30 text-gray-300 flex justify-between items-center">
-                  <span>{nextMatch.teamA.map(p=>p.name.split(' ')[0]).join(' + ')}</span>
-                  <span className="text-gray-600 font-black text-[9px]">VS</span>
-                  <span>{nextMatch.teamB.map(p=>p.name.split(' ')[0]).join(' + ')}</span>
-                </div>
-              ) : (
-                <div className="text-xs text-gray-500 font-medium bg-[#161622]/40 p-3 rounded-xl text-center border border-dashed border-gray-800">Acesta este ultimul meci!</div>
-              )}
-            </div>
           </section>
         )}
 
-        {/* TAB CLASAMENT */}
+        {/* ══════════ TAB: CLASAMENT ══════════ */}
         {tab === "standings" && (
-          <section className="space-y-4">
-            <div className="bg-[#11111a] rounded-2xl border border-gray-800/60 shadow-md overflow-hidden">
-              <div className="grid grid-cols-12 bg-[#161622] p-3 text-[10px] font-black text-gray-500 uppercase border-b border-gray-800/60">
-                <span className="col-span-2 text-center">Poz</span>
-                <span className="col-span-6">Jucător</span>
-                <span className="col-span-2 text-center">Meciuri</span>
-                <span className="col-span-2 text-center">Pct</span>
-              </div>
-              <div className="divide-y divide-gray-800/40">
-                {standings.map((p, idx) => (
-                  <div key={p.id} className="grid grid-cols-12 p-3.5 text-xs items-center">
-                    <span className="col-span-2 text-center font-bold text-gray-500">#{idx + 1}</span>
-                    <span className="col-span-6 font-semibold text-gray-200">{p.name}</span>
-                    <span className="col-span-2 text-center font-medium text-gray-400">{p.matchesPlayed}</span>
-                    <span className="col-span-2 text-center font-black text-green-400 text-sm">{p.points}</span>
+          <section className="space-y-3">
+            {sortedStandings.length === 0 ? (
+              <div className="rounded-2xl border border-white/8 p-10 text-center text-gray-500 text-sm">Niciun turneu activ.</div>
+            ) : (
+              <>
+                {/* Podium */}
+                {sortedStandings.length >= 3 && (
+                  <div className="grid grid-cols-3 gap-2 mb-1">
+                    {[sortedStandings[1], sortedStandings[0], sortedStandings[2]].map((p, visIdx) => {
+                      const rank = visIdx === 1 ? 0 : visIdx === 0 ? 1 : 2;
+                      const heights = ["h-24", "h-32", "h-20"];
+                      const styles = [
+                        "border-sky-400/25 bg-sky-400/4 text-sky-400",
+                        "border-[#00ff88]/35 bg-[#00ff88]/6 text-[#00ff88]",
+                        "border-amber-500/25 bg-amber-500/4 text-amber-500",
+                      ];
+                      return (
+                        <div key={p.id} className={`flex flex-col items-center justify-end rounded-2xl border ${styles[rank]} ${heights[rank]} pb-3 pt-2 px-2`}>
+                          <span className="text-xl mb-1">{medals[rank]}</span>
+                          <span className="text-[10px] font-black text-center text-white leading-tight">{firstName(p.name)}</span>
+                          <span className="text-lg font-black tabular-nums">{p.points}</span>
+                          <span className="text-[8px] opacity-50 font-bold">pct</span>
+                        </div>
+                      );
+                    })}
                   </div>
-                ))}
-              </div>
-            </div>
+                )}
 
-            <div className="bg-[#11111a] p-4 rounded-2xl border border-gray-800/60 text-center">
-              <p className="text-xs text-gray-500">Turneu activ: {allMatches.filter(m => m.saved).length} / {allMatches.length} meciuri încheiate.</p>
-            </div>
+                {/* Table */}
+                <div className="rounded-2xl border border-white/8 overflow-hidden">
+                  <div className="grid grid-cols-12 bg-white/3 px-4 py-2.5 border-b border-white/6">
+                    <span className="col-span-1 text-[8px] font-black text-gray-600 uppercase">#</span>
+                    <span className="col-span-6 text-[8px] font-black text-gray-600 uppercase">Jucător</span>
+                    <span className="col-span-2 text-[8px] font-black text-gray-600 uppercase text-center">Jocuri</span>
+                    <span className="col-span-3 text-[8px] font-black text-gray-600 uppercase text-right">Pct</span>
+                  </div>
+                  <div className="divide-y divide-white/4">
+                    {sortedStandings.map((p, idx) => (
+                      <div key={p.id} className={`grid grid-cols-12 px-4 py-3 items-center ${idx === 0 ? "bg-[#00ff88]/3" : ""}`}>
+                        <span className="col-span-1">
+                          {idx < 3
+                            ? <span className="text-base">{medals[idx]}</span>
+                            : <span className="text-[10px] font-black text-gray-600">{idx + 1}</span>
+                          }
+                        </span>
+                        <div className="col-span-6 flex items-center gap-2">
+                          <div className={`w-7 h-7 rounded-full flex items-center justify-center text-[9px] font-black flex-shrink-0 ${idx === 0 ? "bg-[#00ff88]/12 border border-[#00ff88]/30 text-[#00ff88]" : "bg-white/4 border border-white/8 text-gray-600"}`}>
+                            {initials(p.name)}
+                          </div>
+                          <div>
+                            <p className="text-[11px] font-bold text-white leading-none">{p.name}</p>
+                            <p className={`text-[9px] font-semibold mt-0.5 ${p.goalDiff >= 0 ? "text-gray-600" : "text-red-500/70"}`}>
+                              {p.goalDiff > 0 ? "+" : ""}{p.goalDiff} diff
+                            </p>
+                          </div>
+                        </div>
+                        <span className="col-span-2 text-center text-[11px] text-gray-600 font-semibold tabular-nums">{p.matchesPlayed}</span>
+                        <span className={`col-span-3 text-right font-black text-base tabular-nums ${idx === 0 ? "text-[#00ff88]" : "text-white"}`}>
+                          {p.points}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-center gap-3 py-1">
+                  <div className="h-px flex-1 bg-white/5" />
+                  <span className="text-[9px] font-black text-gray-600 uppercase tracking-wider">
+                    {doneMatches}/{totalMatches} meciuri{doneMatches === totalMatches && totalMatches > 0 ? " · Finalizat 🏆" : ""}
+                  </span>
+                  <div className="h-px flex-1 bg-white/5" />
+                </div>
+              </>
+            )}
           </section>
         )}
 
-        {/* NAVIGARE */}
-        <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-[#11111a]/95 backdrop-blur-md border-t border-gray-800/80 h-16 flex justify-around items-center rounded-t-2xl z-50">
-     
-          <button onClick={() => setTab("selection")} className={`flex flex-col items-center justify-center w-full h-full text-[9px] font-black tracking-widest uppercase ${tab === "selection" ? "text-green-400" : "text-gray-500"}`}><span>👥</span>Start</button>
-          <button onClick={() => setTab("matches")} className={`flex flex-col items-center justify-center w-full h-full text-[9px] font-black tracking-widest uppercase ${tab === "matches" ? "text-green-400" : "text-gray-500"}`}><span>🎾</span>Meciuri</button>
-          <button onClick={() => setTab("standings")} className={`flex flex-col items-center justify-center w-full h-full text-[9px] font-black tracking-widest uppercase ${tab === "standings" ? "text-green-400" : "text-gray-500"}`}><span>🏆</span>Clasament</button>
-               <button onClick={() => setTab("players")} className={`flex flex-col items-center justify-center w-full h-full text-[9px] font-black tracking-widest uppercase ${tab === "players" ? "text-green-400" : "text-gray-500"}`}><span>⚙️</span>Jucători</button>
-        </nav>
+        {/* ══════════ TAB: JUCĂTORI ══════════ */}
+        {tab === "players" && (
+          <section className="space-y-4">
+            <div className="rounded-2xl border border-white/8 bg-white/[0.02] p-4 space-y-3">
+              <p className="text-[9px] font-black uppercase tracking-[0.25em] text-gray-500">Adaugă jucător</p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="Numele jucătorului..."
+                  value={newPlayerName}
+                  onChange={(e) => setNewPlayerName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAddPlayer()}
+                  className="flex-1 bg-white/4 border border-white/8 focus:border-[#00ff88]/40 text-white text-sm font-semibold px-4 py-3 rounded-xl outline-none transition-all placeholder:text-gray-700"
+                />
+                <button
+                  onClick={handleAddPlayer}
+                  className="bg-[#00ff88] hover:bg-[#00e87a] active:scale-95 text-[#06070f] font-black px-5 rounded-xl text-lg transition-all"
+                >
+                  +
+                </button>
+              </div>
+            </div>
 
+            <div className="flex items-center justify-between px-0.5 mb-1">
+              <p className="text-[9px] font-black uppercase tracking-[0.25em] text-gray-500">Jucători înregistrați</p>
+              <span className="text-[9px] font-bold text-gray-600">{dbPlayers.length} total</span>
+            </div>
+
+            <div className="space-y-2 max-h-[55vh] overflow-y-auto pr-0.5">
+              {dbPlayers.map((p) => (
+                <div key={p.id} className="flex items-center gap-3 px-4 py-3 rounded-xl border border-white/7 bg-white/[0.02] hover:bg-white/3 transition-all">
+                  {editingId === p.id ? (
+                    <div className="flex gap-2 flex-1">
+                      <input
+                        type="text"
+                        value={editingName}
+                        onChange={(e) => setEditingName(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleSaveEdit(p.id)}
+                        autoFocus
+                        className="flex-1 bg-white/5 border border-[#00ff88]/25 text-white text-xs font-semibold px-3 py-2 rounded-lg outline-none"
+                      />
+                      <button onClick={() => handleSaveEdit(p.id)} className="bg-[#00ff88] text-[#06070f] text-[10px] font-black px-3 py-2 rounded-lg">✓</button>
+                      <button onClick={() => setEditingId(null)} className="bg-white/6 text-gray-500 text-[10px] font-black px-3 py-2 rounded-lg">✕</button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="w-8 h-8 rounded-full bg-white/5 border border-white/8 flex items-center justify-center text-[10px] font-black text-gray-500">
+                        {initials(p.name)}
+                      </div>
+                      <span className="flex-1 text-sm font-semibold text-gray-300">{p.name}</span>
+                      <button onClick={() => { setEditingId(p.id); setEditingName(p.name); }} className="text-gray-700 hover:text-gray-400 transition-colors text-sm p-1">✏️</button>
+                      <button onClick={() => handleDeletePlayer(p.id)} className="text-gray-700 hover:text-red-400 transition-colors text-sm p-1">🗑️</button>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
       </div>
+
+      {/* ── BOTTOM NAV ── */}
+      <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto z-50">
+        <div className="bg-[#06070f]/96 backdrop-blur-xl border-t border-white/7 flex">
+          {navBtn("selection", "👥", "Start")}
+          {navBtn("matches", "🎾", "Meciuri")}
+          {navBtn("standings", "🏆", "Clasament")}
+          {navBtn("players", "⚙️", "Jucători")}
+        </div>
+      </nav>
     </div>
   );
 }
